@@ -1,7 +1,5 @@
 package com.example.watchapplication;
 
-import static java.util.stream.Collectors.joining;
-
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.location.Location;
@@ -20,11 +18,25 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
-import java.text.DecimalFormat;
-import java.util.Arrays;
-import java.util.Comparator;
+import com.google.android.gms.tasks.Task;
+import com.google.android.gms.wearable.CapabilityClient;
+import com.google.android.gms.wearable.CapabilityInfo;
+import com.google.android.gms.wearable.MessageClient;
+import com.google.android.gms.wearable.MessageEvent;
+import com.google.android.gms.wearable.Node;
+import com.google.android.gms.wearable.Wearable;
 
-public class MainActivity extends AppCompatActivity {
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+public class MainActivity extends AppCompatActivity implements MessageClient.OnMessageReceivedListener {
     private static final int LOCATION_PERMISSION_REQUEST_CODE = 1234;
     private LocationManager locationManager;
 
@@ -72,9 +84,7 @@ public class MainActivity extends AppCompatActivity {
         searchButton.setEnabled(false);
         getLocationPermission();
 
-        searchButton.setOnClickListener(v -> {
-            getLocation();
-        });
+        searchButton.setOnClickListener(v -> getLocation());
 
         updateRadiusTextView();
 
@@ -95,6 +105,8 @@ public class MainActivity extends AppCompatActivity {
                 // Do nothing
             }
         });
+
+        Wearable.getMessageClient(this).addListener(this);
     }
 
     private void updateRadiusTextView() {
@@ -111,7 +123,6 @@ public class MainActivity extends AppCompatActivity {
                     currentLongitude = location.getLongitude();
                     currentLatitude = location.getLatitude();
                 }
-                public void onStatusChanged(String provider, int status, Bundle extras) {}
                 public void onProviderEnabled(String provider) {}
                 public void onProviderDisabled(String provider) {}
             };
@@ -175,13 +186,17 @@ public class MainActivity extends AppCompatActivity {
             searchButton.setEnabled(true);
             if (response.isSuccessful()) {
                 MonumentResponse monumentResponse = response.body();
+                List<MonumentInfo> monumentInfoList = new ArrayList<>();
                 if (monumentResponse != null && monumentResponse.monuments.length > 0) {
                     monumentList.removeAllViews();
                     Arrays.stream(monumentResponse.monuments).map(MonumentInfo::new)
                             .sorted(Comparator.comparing(m -> m.distance))
-                            .map(MonumentInfo::toString)
-                            .forEach(this::addItemToMonumentList);
+                            .forEach(info -> {
+                                monumentInfoList.add(info);
+                                addItemToMonumentList(info.toString());
+                            });
 
+                    sendMonumentListToWear(monumentInfoList);
                 } else {
                     noMonumentFount();
                 }
@@ -190,6 +205,38 @@ public class MainActivity extends AppCompatActivity {
             searchButton.setEnabled(true);
             noMonumentFount();
         }).request();
+    }
+
+    private void sendMonumentListToWear(List<MonumentInfo> monumentInfoList) {
+        CapabilityClient capabilityClient = Wearable.getCapabilityClient(this);
+        Task<Map<String, CapabilityInfo>> capabilityTask =
+                capabilityClient.getAllCapabilities(CapabilityClient.FILTER_REACHABLE);
+
+        capabilityTask.addOnSuccessListener(capabilityInfoMap -> {
+            if (capabilityInfoMap.isEmpty()) {
+                Log.i("MainActivity", "No wear devices found");
+                return;
+            }
+
+            CapabilityInfo capacityInfo = capabilityInfoMap.get("receive_monument_list");
+            if (capacityInfo == null) {
+                Log.i("MainActivity",
+                      "No wear devices with the required capability found");
+                return;
+            }
+
+            Set<Node> nodes = capacityInfo.getNodes();
+            if (!nodes.isEmpty()) {
+                Node node = nodes.iterator().next();
+                Log.i("MainActivity", "Node found: " + node.getDisplayName());
+                MessageClient messageClient = Wearable.getMessageClient(this);
+                messageClient.sendMessage(node.getId(), "/monument_list",
+                                          monumentInfoList.stream().map(MonumentInfo::toString).collect(
+                                                  Collectors.joining("\n")).getBytes());
+            } else {
+                Log.i("MainActivity", "No wear devices with the required capability found: " + capacityInfo);
+            }
+        });
     }
 
     private void addItemToMonumentList(String s) {
@@ -236,6 +283,13 @@ public class MainActivity extends AppCompatActivity {
                 .show();
         monumentList.removeAllViews();
         addItemToMonumentList(getString(R.string.no_monument_around));
+        sendMonumentListToWear(Collections.emptyList());
+    }
+
+    @Override
+    public void onMessageReceived(@NonNull MessageEvent messageEvent) {
+        Log.i("MainActivity", "Message received: " + messageEvent.getPath());
+        getMonuments();
     }
 
     public class MonumentInfo {
@@ -252,6 +306,7 @@ public class MainActivity extends AppCompatActivity {
                     calculateDistance(currentLatitude, currentLongitude, latitude, longitude);
         }
 
+        @NonNull
         public String toString() {
             if (distance < 1000) {
                 int distanceInMeters = (int) Math.round(distance);
